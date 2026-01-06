@@ -661,6 +661,62 @@ class MovieMakerGUI(QMainWindow):
         p.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
         self.setPalette(p)
 
+        # Apply stylesheet for widgets that don't respect palette on macOS/Windows
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: #454545;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #353535;
+            }
+            QPushButton:disabled {
+                background-color: #3a3a3a;
+                color: #888;
+            }
+            QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox {
+                background-color: #353535;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 2px 5px;
+            }
+            QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled, QComboBox:disabled {
+                background-color: #2a2a2a;
+                color: #666;
+            }
+            QGroupBox {
+                color: white;
+                border: 1px solid #555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QCheckBox {
+                color: white;
+            }
+            QListWidget {
+                background-color: #353535;
+                color: white;
+                border: 1px solid #555;
+            }
+            QScrollArea {
+                background-color: #353535;
+                border: 1px solid #555;
+            }
+        """)
+
     def init_ui(self):
         self.setWindowTitle("Timelapse Movie Maker")
         self.setMinimumSize(1200, 800)
