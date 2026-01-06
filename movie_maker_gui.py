@@ -47,11 +47,12 @@ def find_matching_response_folder(baseline_path: str) -> Optional[str]:
     """
     Auto-detect matching response folder for a baseline folder.
 
-    Folder naming convention: {prefix}_{name}_{date}_{time}
-    - Baseline prefixes: "before_", "baseline_"
-    - Response prefixes: "after_", "response_"
+    Folder naming convention:
+    - Baseline: {name}_before...
+    - Response: {name}_after...
 
-    Strips the last two underscore-separated parts (date and time) to get the core name.
+    Extracts the {name} part from baseline (everything before "_before")
+    and looks for a matching response folder with "{name}_after" pattern.
 
     Returns the matching response folder path if exactly one match is found,
     otherwise returns None.
@@ -63,52 +64,29 @@ def find_matching_response_folder(baseline_path: str) -> Optional[str]:
     parent_dir = baseline_dir.parent
     folder_name = baseline_dir.name
 
-    baseline_prefixes = ["before_", "baseline_"]
-    response_prefixes = ["after_", "response_"]
+    # Check if folder contains "_before" pattern
+    lower_name = folder_name.lower()
+    before_idx = lower_name.find("_before")
 
-    core_name = folder_name
-    matched_prefix = None
-
-    # Strip baseline prefix
-    for prefix in baseline_prefixes:
-        if folder_name.lower().startswith(prefix):
-            core_name = folder_name[len(prefix):]
-            matched_prefix = prefix
-            break
-
-    if matched_prefix is None:
+    if before_idx == -1:
         # Not a baseline folder pattern
         return None
 
-    # Strip last two underscore-separated parts (date and time)
-    parts = core_name.rsplit('_', 2)
-    if len(parts) >= 3:
-        core_name = parts[0]
+    # Extract the name part (everything before "_before")
+    core_name = folder_name[:before_idx]
 
-    # Now search for matching response folders
+    # Now search for matching response folders with "{name}_after" pattern
     matching_responses = []
 
     for item in parent_dir.iterdir():
         if not item.is_dir():
             continue
 
-        item_name = item.name
-
-        # Check if it starts with a response prefix
-        for resp_prefix in response_prefixes:
-            if item_name.lower().startswith(resp_prefix):
-                # Extract core name from response folder
-                resp_core = item_name[len(resp_prefix):]
-
-                # Strip last two parts from response
-                resp_parts = resp_core.rsplit('_', 2)
-                if len(resp_parts) >= 3:
-                    resp_core = resp_parts[0]
-
-                # Check if core names match (case-insensitive)
-                if resp_core.lower() == core_name.lower():
-                    matching_responses.append(str(item))
-                break
+        item_lower = item.name.lower()
+        # Check if folder starts with "{name}_after" (case-insensitive)
+        expected_prefix = core_name.lower() + "_after"
+        if item_lower.startswith(expected_prefix):
+            matching_responses.append(str(item))
 
     # Return only if exactly one match
     if len(matching_responses) == 1:
