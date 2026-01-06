@@ -813,6 +813,7 @@ class MovieMakerGUI(QMainWindow):
         self.pairs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.pairs_container = QWidget()
+        self.pairs_container.setStyleSheet("background-color: #353535;")
         self.pairs_container_layout = QVBoxLayout(self.pairs_container)
         self.pairs_container_layout.setAlignment(Qt.AlignTop)
         self.pairs_container_layout.setSpacing(5)
@@ -854,6 +855,7 @@ class MovieMakerGUI(QMainWindow):
 
         # Channel controls container (no scroll, show all channels)
         self.channel_container = QWidget()
+        self.channel_container.setStyleSheet("background-color: #353535;")
         self.channel_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.channel_container_layout = QVBoxLayout(self.channel_container)
         self.channel_container_layout.setContentsMargins(0, 0, 0, 0)
