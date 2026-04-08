@@ -640,17 +640,28 @@ def add_timestamp_overlay(frame: np.ndarray, timepoint: int, dt_seconds: float, 
         if label:
             time_str = f"{label} - {time_str}"
 
-        # Try to use a reasonable font
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
-        except:
+        # Scale font size to image dimensions
+        img_h, img_w = frame.shape[:2]
+        font_size = max(16, min(img_h, img_w) // 30)
+
+        font = None
+        for font_path in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      # Linux
+            "/System/Library/Fonts/Helvetica.ttc",                    # macOS
+            "C:/Windows/Fonts/arial.ttf",                             # Windows
+            "C:/Windows/Fonts/segoeui.ttf",                           # Windows fallback
+        ]:
             try:
-                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
-            except:
-                font = ImageFont.load_default()
+                font = ImageFont.truetype(font_path, font_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
 
         # Draw text with shadow for visibility
-        text_pos = (10, 10)
+        margin = max(5, font_size // 3)
+        text_pos = (margin, margin)
         draw.text((text_pos[0]+1, text_pos[1]+1), time_str, fill=(0, 0, 0), font=font)
         draw.text(text_pos, time_str, fill=(255, 255, 255), font=font)
 
