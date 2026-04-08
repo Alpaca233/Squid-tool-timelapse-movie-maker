@@ -27,19 +27,14 @@ from PyQt5.QtGui import QPalette, QColor, QImage, QPixmap
 
 import numpy as np
 
-# Try to import superqt range slider
-try:
-    from superqt import QRangeSlider
-    RANGE_SLIDER_AVAILABLE = True
-except ImportError:
-    RANGE_SLIDER_AVAILABLE = False
-
 from movie_maker_backend import (
     AcquisitionFolder, AcquisitionParams, ChannelSettings,
     FolderPairSettings, discover_channels_for_pair,
     compute_auto_contrast_for_pair, generate_movie_pair,
     load_preview_frame, get_max_intensity_projection,
-    wavelength_to_rgb, apply_contrast, colorize_channel
+    wavelength_to_rgb, apply_contrast, colorize_channel, create_composite_frame,
+    open_acquisition_folder, detect_folder_type, ZarrAcquisitionFolder,
+    clear_folder_cache, TENSORSTORE_AVAILABLE
 )
 
 
@@ -186,36 +181,25 @@ class ChannelContrastWidget(QWidget):
         self.min_spin.valueChanged.connect(self._on_spin_changed)
         layout.addWidget(self.min_spin)
 
-        # Range slider (if available) or fallback to two sliders
-        if RANGE_SLIDER_AVAILABLE:
-            self.range_slider = QRangeSlider(Qt.Horizontal)
-            self.range_slider.setRange(0, 65535)
-            self.range_slider.setValue((0, 65535))
-            self.range_slider.valueChanged.connect(self._on_range_slider_changed)
-            layout.addWidget(self.range_slider, 1)
-            self.min_slider = None
-            self.max_slider = None
-        else:
-            # Fallback: use two regular sliders side by side
-            self.range_slider = None
-            slider_container = QWidget()
-            slider_layout = QHBoxLayout(slider_container)
-            slider_layout.setContentsMargins(0, 0, 0, 0)
-            slider_layout.setSpacing(2)
+        # Two sliders for min/max contrast
+        slider_container = QWidget()
+        slider_layout = QHBoxLayout(slider_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(2)
 
-            self.min_slider = QSlider(Qt.Horizontal)
-            self.min_slider.setRange(0, 65535)
-            self.min_slider.setValue(0)
-            self.min_slider.valueChanged.connect(self._on_min_slider_changed)
-            slider_layout.addWidget(self.min_slider, 1)
+        self.min_slider = QSlider(Qt.Horizontal)
+        self.min_slider.setRange(0, 65535)
+        self.min_slider.setValue(0)
+        self.min_slider.valueChanged.connect(self._on_min_slider_changed)
+        slider_layout.addWidget(self.min_slider, 1)
 
-            self.max_slider = QSlider(Qt.Horizontal)
-            self.max_slider.setRange(0, 65535)
-            self.max_slider.setValue(65535)
-            self.max_slider.valueChanged.connect(self._on_max_slider_changed)
-            slider_layout.addWidget(self.max_slider, 1)
+        self.max_slider = QSlider(Qt.Horizontal)
+        self.max_slider.setRange(0, 65535)
+        self.max_slider.setValue(65535)
+        self.max_slider.valueChanged.connect(self._on_max_slider_changed)
+        slider_layout.addWidget(self.max_slider, 1)
 
-            layout.addWidget(slider_container, 1)
+        layout.addWidget(slider_container, 1)
 
         # Max spinbox
         self.max_spin = QSpinBox()
@@ -236,28 +220,13 @@ class ChannelContrastWidget(QWidget):
         if self._updating:
             return
         self._updating = True
-        if self.range_slider:
-            self.range_slider.setValue((self.min_spin.value(), self.max_spin.value()))
-        else:
-            if self.min_slider:
-                self.min_slider.setValue(self.min_spin.value())
-            if self.max_slider:
-                self.max_slider.setValue(self.max_spin.value())
-        self._updating = False
-        self.contrast_changed.emit()
-
-    def _on_range_slider_changed(self, value):
-        """Handle range slider value change."""
-        if self._updating:
-            return
-        self._updating = True
-        self.min_spin.setValue(value[0])
-        self.max_spin.setValue(value[1])
+        self.min_slider.setValue(self.min_spin.value())
+        self.max_slider.setValue(self.max_spin.value())
         self._updating = False
         self.contrast_changed.emit()
 
     def _on_min_slider_changed(self, value):
-        """Handle min slider change (fallback mode)."""
+        """Handle min slider change."""
         if self._updating:
             return
         self._updating = True
@@ -266,7 +235,7 @@ class ChannelContrastWidget(QWidget):
         self.contrast_changed.emit()
 
     def _on_max_slider_changed(self, value):
-        """Handle max slider change (fallback mode)."""
+        """Handle max slider change."""
         if self._updating:
             return
         self._updating = True
@@ -289,13 +258,8 @@ class ChannelContrastWidget(QWidget):
         self._updating = True
         self.min_spin.setValue(int(vmin))
         self.max_spin.setValue(int(vmax))
-        if self.range_slider:
-            self.range_slider.setValue((int(vmin), int(vmax)))
-        else:
-            if self.min_slider:
-                self.min_slider.setValue(int(vmin))
-            if self.max_slider:
-                self.max_slider.setValue(int(vmax))
+        self.min_slider.setValue(int(vmin))
+        self.max_slider.setValue(int(vmax))
         self._updating = False
         self.contrast_changed.emit()
 
@@ -364,10 +328,11 @@ class PreviewWidget(QWidget):
         self.response_folder = None
         self.channel_settings = {}
 
-    def set_folders(self, baseline_path: Optional[str], response_path: Optional[str]):
+    def set_folders(self, baseline_path: Optional[str], response_path: Optional[str],
+                    scale_level: int = 0):
         """Set the folders to preview."""
-        self.baseline_folder = AcquisitionFolder(baseline_path) if baseline_path else None
-        self.response_folder = AcquisitionFolder(response_path) if response_path else None
+        self.baseline_folder = open_acquisition_folder(baseline_path, scale_level=scale_level) if baseline_path else None
+        self.response_folder = open_acquisition_folder(response_path, scale_level=scale_level) if response_path else None
 
         # Update timepoint sliders
         baseline_max = 0
@@ -444,30 +409,9 @@ class PreviewWidget(QWidget):
         else:
             self.image_label.setText("No data to display")
 
-    def _create_composite_frame(self, folder: AcquisitionFolder, timepoint: int) -> Optional[np.ndarray]:
+    def _create_composite_frame(self, folder, timepoint: int) -> Optional[np.ndarray]:
         """Create a composite frame from folder at given timepoint."""
-        images = folder.load_timepoint_all_channels(timepoint)
-        if not images:
-            return None
-
-        first_img = next(iter(images.values()))
-        h, w = first_img.shape[:2]
-        composite = np.zeros((h, w, 3), dtype=np.float32)
-
-        for ch_name, img in images.items():
-            if ch_name not in self.channel_settings:
-                continue
-
-            settings = self.channel_settings[ch_name]
-            if not settings.enabled:
-                continue
-
-            img_contrast = apply_contrast(img, settings.contrast_min, settings.contrast_max)
-            rgb = wavelength_to_rgb(settings.wavelength)
-            colored = colorize_channel(img_contrast, rgb)
-            composite += colored.astype(np.float32)
-
-        return np.clip(composite, 0, 255).astype(np.uint8)
+        return create_composite_frame(folder, timepoint, self.channel_settings)
 
     def _display_frame(self, frame: np.ndarray):
         """Display a frame in the image label."""
@@ -506,14 +450,15 @@ class PairRowWidget(QWidget):
 
     selection_changed = pyqtSignal(int)  # Emits row index when selected
 
-    def __init__(self, row_index: int, baseline_path: str, response_path: str, parent=None):
+    def __init__(self, row_index: int, baseline_path: str, response_path: str,
+                 scale_level: int = 0, parent=None):
         super().__init__(parent)
         self.row_index = row_index
         self.baseline_path = baseline_path
         self.response_path = response_path
 
         # Load acquisition params for dt
-        self.baseline_folder = AcquisitionFolder(baseline_path)
+        self.baseline_folder = open_acquisition_folder(baseline_path, scale_level=scale_level)
         self.dt_seconds = self.baseline_folder.params.dt_seconds
 
         layout = QHBoxLayout(self)
@@ -584,14 +529,16 @@ class PairRowWidget(QWidget):
         """Set selection state."""
         self.select_btn.setChecked(selected)
 
-    def get_settings(self, channel_settings: Dict[str, ChannelSettings]) -> FolderPairSettings:
+    def get_settings(self, channel_settings: Dict[str, ChannelSettings],
+                     scale_level: int = 0) -> FolderPairSettings:
         """Get settings for this pair."""
         return FolderPairSettings(
             baseline_path=self.baseline_path,
             response_path=self.response_path,
             channels=channel_settings,
             frame_interval_seconds=self.dt_seconds,
-            output_fps=self.fps_spin.value()
+            output_fps=self.fps_spin.value(),
+            scale_level=scale_level
         )
 
 
@@ -661,7 +608,6 @@ class MovieMakerGUI(QMainWindow):
         p.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
         self.setPalette(p)
 
-        # Apply stylesheet for widgets that don't respect palette on macOS/Windows
         self.setStyleSheet("""
             QPushButton {
                 background-color: #454545;
@@ -687,6 +633,13 @@ class MovieMakerGUI(QMainWindow):
                 border-radius: 3px;
                 padding: 2px 5px;
             }
+            QComboBox QAbstractItemView {
+                background-color: #353535;
+                color: white;
+                border: 1px solid #555;
+                selection-background-color: #2196F3;
+                selection-color: white;
+            }
             QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled, QComboBox:disabled {
                 background-color: #2a2a2a;
                 color: #666;
@@ -706,6 +659,14 @@ class MovieMakerGUI(QMainWindow):
             QCheckBox {
                 color: white;
             }
+            QCheckBox::indicator:unchecked {
+                background-color: #353535;
+                border: 1px solid #888;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #2196F3;
+                border: 1px solid #2196F3;
+            }
             QListWidget {
                 background-color: #353535;
                 color: white;
@@ -714,6 +675,22 @@ class MovieMakerGUI(QMainWindow):
             QScrollArea {
                 background-color: #353535;
                 border: 1px solid #555;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #555;
+                height: 6px;
+                background: #2a2a2a;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                border: 1px solid #1976D2;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #42A5F5;
             }
         """)
 
@@ -743,6 +720,30 @@ class MovieMakerGUI(QMainWindow):
         output_layout.addWidget(self.output_dir_btn)
 
         left_layout.addWidget(output_group)
+
+        # Downsample factor (for large stitched/zarr data)
+        downsample_layout = QHBoxLayout()
+        downsample_label = QLabel("Downsample Factor:")
+        downsample_label.setToolTip(
+            "Downsample factor for large stitched images.\n"
+            "For OME-Zarr data, uses built-in pyramid levels.\n"
+            "Higher values = smaller images, faster processing."
+        )
+        downsample_layout.addWidget(downsample_label)
+
+        self.downsample_spin = QComboBox()
+        self.downsample_spin.addItems(["1x", "2x", "4x", "8x", "16x"])
+        self.downsample_spin.setCurrentIndex(0)
+        self.downsample_spin.setFixedWidth(70)
+        self.downsample_spin.currentIndexChanged.connect(self._on_downsample_changed)
+        downsample_layout.addWidget(self.downsample_spin)
+
+        self.downsample_size_label = QLabel("")
+        self.downsample_size_label.setStyleSheet("color: #888;")
+        downsample_layout.addWidget(self.downsample_size_label)
+
+        downsample_layout.addStretch()
+        left_layout.addLayout(downsample_layout)
 
         # Drop zones
         drop_group = QGroupBox("Acquisition Folders (Drag Here)")
@@ -887,6 +888,42 @@ class MovieMakerGUI(QMainWindow):
         for item in list_widget.selectedItems():
             list_widget.takeItem(list_widget.row(item))
 
+    def _get_scale_level(self) -> int:
+        """Get the current scale level from the downsample combo box.
+
+        Maps combo index (0=1x, 1=2x, 2=4x, 3=8x, 4=16x) to scale level.
+        For zarr data with pyramids, this maps directly to the pyramid level.
+        """
+        return self.downsample_spin.currentIndex()
+
+    def _on_downsample_changed(self):
+        """Handle downsample factor change — rebuild pairs and refresh preview."""
+        self.per_pair_settings.clear()
+        clear_folder_cache()
+        self._update_downsample_size_label()
+        self.on_lists_changed()
+
+    def _update_downsample_size_label(self):
+        """Update the label showing the image size at the current downsample level."""
+        if not self.pair_rows:
+            self.downsample_size_label.setText("")
+            return
+
+        row = self.pair_rows[0]
+        scale_level = self._get_scale_level()
+        folder = open_acquisition_folder(row.baseline_path, scale_level=scale_level)
+        if isinstance(folder, ZarrAcquisitionFolder):
+            self.downsample_size_label.setText(
+                f"({folder.image_height} x {folder.image_width})")
+        elif hasattr(folder, 'timepoints') and folder.timepoints:
+            img = folder.load_image(folder.timepoints[0], folder.channels[0] if folder.channels else "")
+            if img is not None:
+                self.downsample_size_label.setText(f"({img.shape[0]} x {img.shape[1]})")
+            else:
+                self.downsample_size_label.setText("")
+        else:
+            self.downsample_size_label.setText("")
+
     def on_baseline_folders_dropped(self, dropped_paths: List[str]):
         """Handle baseline folders being dropped - auto-detect matching response folders."""
         if not self.auto_detect_cb.isChecked():
@@ -928,14 +965,18 @@ class MovieMakerGUI(QMainWindow):
         self.no_channels_label.setVisible(pair_count == 0)
 
         # Create pair rows
+        scale_level = self._get_scale_level()
         for i in range(pair_count):
             baseline_path = self.baseline_list.item(i).text()
             response_path = self.response_list.item(i).text()
 
-            row = PairRowWidget(i, baseline_path, response_path)
+            row = PairRowWidget(i, baseline_path, response_path, scale_level=scale_level)
             row.selection_changed.connect(self.on_row_selected)
             self.pair_rows.append(row)
             self.pairs_container_layout.addWidget(row)
+
+        # Update size label
+        self._update_downsample_size_label()
 
         # Select first row if available and update preview
         if self.pair_rows:
@@ -971,7 +1012,9 @@ class MovieMakerGUI(QMainWindow):
         row = self.pair_rows[row_index]
 
         # Discover channels for this pair
-        channels = discover_channels_for_pair(row.baseline_path, row.response_path)
+        scale_level = self._get_scale_level()
+        channels = discover_channels_for_pair(row.baseline_path, row.response_path,
+                                              scale_level=scale_level)
 
         # Clear existing channel widgets
         for widget in self.channel_widgets.values():
@@ -996,7 +1039,8 @@ class MovieMakerGUI(QMainWindow):
                 widget.set_contrast(s.contrast_min, s.contrast_max)
             else:
                 # Auto contrast by default for new pairs
-                lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path, ch_name)
+                lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path,
+                                                       ch_name, scale_level=scale_level)
                 widget.set_contrast(lo, hi)
 
             self.channel_widgets[ch_name] = widget
@@ -1010,7 +1054,8 @@ class MovieMakerGUI(QMainWindow):
             self._save_current_pair_settings()
 
         # Update preview
-        self.preview_widget.set_folders(row.baseline_path, row.response_path)
+        self.preview_widget.set_folders(row.baseline_path, row.response_path,
+                                        scale_level=scale_level)
         self.preview_widget.set_channel_settings(self.current_channel_settings)
 
     def _save_current_pair_settings(self):
@@ -1037,7 +1082,9 @@ class MovieMakerGUI(QMainWindow):
             return
 
         row = self.pair_rows[self.selected_row_index]
-        lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path, channel_name)
+        scale_level = self._get_scale_level()
+        lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path,
+                                                channel_name, scale_level=scale_level)
 
         if channel_name in self.channel_widgets:
             self.channel_widgets[channel_name].set_contrast(lo, hi)
@@ -1048,9 +1095,11 @@ class MovieMakerGUI(QMainWindow):
             return
 
         row = self.pair_rows[self.selected_row_index]
+        scale_level = self._get_scale_level()
 
         for ch_name in self.channel_widgets:
-            lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path, ch_name)
+            lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path,
+                                                    ch_name, scale_level=scale_level)
             self.channel_widgets[ch_name].set_contrast(lo, hi)
 
     def select_output_dir(self):
@@ -1075,22 +1124,25 @@ class MovieMakerGUI(QMainWindow):
         self._save_current_pair_settings()
 
         # Collect pairs with their individual settings
+        scale_level = self._get_scale_level()
         pairs = []
         for i, row in enumerate(self.pair_rows):
             # Get settings for this specific pair (use auto-contrast if not set)
             pair_channel_settings = self.per_pair_settings.get(i)
             if not pair_channel_settings:
                 # Auto-contrast for pairs that were never selected
-                channels = discover_channels_for_pair(row.baseline_path, row.response_path)
+                channels = discover_channels_for_pair(row.baseline_path, row.response_path,
+                                                      scale_level=scale_level)
                 pair_channel_settings = {}
                 for ch_name, ch_settings in channels.items():
-                    lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path, ch_name)
+                    lo, hi = compute_auto_contrast_for_pair(row.baseline_path, row.response_path,
+                                                           ch_name, scale_level=scale_level)
                     ch_settings.contrast_min = lo
                     ch_settings.contrast_max = hi
                     pair_channel_settings[ch_name] = ch_settings
                 self.per_pair_settings[i] = pair_channel_settings
 
-            settings = row.get_settings(pair_channel_settings)
+            settings = row.get_settings(pair_channel_settings, scale_level=scale_level)
             name = f"movie_{os.path.basename(row.baseline_path)}"
             pairs.append((settings, name))
 

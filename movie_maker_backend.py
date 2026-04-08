@@ -38,6 +38,13 @@ try:
 except ImportError:
     FFMPEG_AVAILABLE = False
 
+# Optional: tensorstore for OME-Zarr v3 support
+try:
+    import tensorstore as ts
+    TENSORSTORE_AVAILABLE = True
+except ImportError:
+    TENSORSTORE_AVAILABLE = False
+
 
 # Filename pattern for single TIFF files
 FPATTERN = re.compile(r"(?P<r>[^_]+)_(?P<f>\d+)_(?P<z>\d+)_(?P<c>.+)\.tiff?", re.IGNORECASE)
@@ -95,6 +102,7 @@ class FolderPairSettings:
     channels: Dict[str, ChannelSettings] = field(default_factory=dict)
     frame_interval_seconds: float = 1.0
     output_fps: int = 10
+    scale_level: int = 0
 
     def get_channel_names(self) -> List[str]:
         """Get sorted list of channel names."""
@@ -167,7 +175,25 @@ def wavelength_to_rgb(wavelength: Optional[int]) -> Tuple[int, int, int]:
     return (255, 255, 255)  # White
 
 
-class AcquisitionFolder:
+class AcquisitionFolderBase:
+    """Shared interface for acquisition folder types."""
+
+    channels: List[str]
+
+    def load_image(self, timepoint: int, channel: str, z: int = 0) -> Optional[np.ndarray]:
+        raise NotImplementedError
+
+    def load_timepoint_all_channels(self, timepoint: int) -> Dict[str, np.ndarray]:
+        """Load all channels for a single timepoint."""
+        images = {}
+        for channel in self.channels:
+            img = self.load_image(timepoint, channel)
+            if img is not None:
+                images[channel] = img
+        return images
+
+
+class AcquisitionFolder(AcquisitionFolderBase):
     """Represents a single acquisition folder with timepoint subfolders."""
 
     def __init__(self, folder_path: str):
@@ -238,22 +264,178 @@ class AcquisitionFolder:
             print(f"Error loading {path}: {e}")
             return None
 
-    def load_timepoint_all_channels(self, timepoint: int) -> Dict[str, np.ndarray]:
-        """Load all channels for a single timepoint."""
-        images = {}
-        for channel in self.channels:
-            img = self.load_image(timepoint, channel)
-            if img is not None:
-                images[channel] = img
-        return images
+
+class ZarrAcquisitionFolder(AcquisitionFolderBase):
+    """Represents an OME-Zarr v3 fused/stitched acquisition folder.
+
+    Reads multiscale pyramid data via tensorstore. Supports selecting
+    a pyramid level (scale_level) for downsampled access.
+    """
+
+    def __init__(self, folder_path: str, scale_level: int = 0):
+        if not TENSORSTORE_AVAILABLE:
+            raise ImportError("tensorstore is required for OME-Zarr support")
+
+        self.path = Path(folder_path)
+        self.scale_level = scale_level
+        self._ome_meta = self._load_ome_metadata()
+        self.available_scales = self._discover_scales()
+
+        # Clamp scale_level to available range
+        if self.scale_level >= len(self.available_scales):
+            self.scale_level = len(self.available_scales) - 1
+
+        self._array = self._open_array()
+        shape = self._array.shape  # (t, c, z, y, x)
+        self.num_timepoints = shape[0]
+        self.num_channels = shape[1]
+        self.num_z = shape[2]
+        self.image_height = shape[3]
+        self.image_width = shape[4]
+
+        self.timepoints = list(range(self.num_timepoints))
+        self.channels = [f"ch{i}" for i in range(self.num_channels)]
+        self._channel_index = {name: i for i, name in enumerate(self.channels)}
+        self.params = self._build_params()
+
+    def _load_ome_metadata(self) -> dict:
+        """Load OME metadata from root zarr.json."""
+        zarr_json = self.path / "zarr.json"
+        if zarr_json.exists():
+            with open(zarr_json, 'r') as f:
+                data = json.load(f)
+            return data.get("attributes", {}).get("ome", {})
+        return {}
+
+    def _discover_scales(self) -> List[dict]:
+        """Discover available pyramid scale levels."""
+        multiscales = self._ome_meta.get("multiscales", [])
+        if multiscales:
+            return multiscales[0].get("datasets", [])
+        # Fallback: probe for scale directories
+        scales = []
+        for i in range(20):
+            scale_dir = self.path / f"scale{i}" / "image"
+            zarr_json = scale_dir / "zarr.json"
+            if zarr_json.exists():
+                scales.append({"path": f"scale{i}/image"})
+            else:
+                break
+        return scales
+
+    def get_scale_shapes(self) -> List[Tuple[int, int]]:
+        """Get (height, width) for each available scale level."""
+        shapes = []
+        for scale_info in self.available_scales:
+            rel_path = scale_info["path"]
+            zarr_json = self.path / rel_path / "zarr.json"
+            if zarr_json.exists():
+                with open(zarr_json, 'r') as f:
+                    meta = json.load(f)
+                shape = meta.get("shape", [])
+                if len(shape) >= 2:
+                    shapes.append((shape[-2], shape[-1]))
+                else:
+                    shapes.append((0, 0))
+            else:
+                shapes.append((0, 0))
+        return shapes
+
+    def get_downsample_factors(self) -> List[int]:
+        """Get the effective downsample factor for each scale level."""
+        shapes = self.get_scale_shapes()
+        if not shapes:
+            return [1]
+        full_h = shapes[0][0]
+        factors = []
+        for h, w in shapes:
+            factor = round(full_h / h) if h > 0 else 1
+            factors.append(max(1, factor))
+        return factors
+
+    def _open_array(self):
+        """Open the tensorstore array for the current scale level."""
+        if self.scale_level < len(self.available_scales):
+            rel_path = self.available_scales[self.scale_level]["path"]
+        else:
+            rel_path = "scale0/image"
+
+        spec = {
+            'driver': 'zarr3',
+            'kvstore': {'driver': 'file', 'path': str(self.path / rel_path)},
+        }
+        return ts.open(spec).result()
+
+    def _build_params(self) -> AcquisitionParams:
+        """Build acquisition params from zarr metadata."""
+        params = AcquisitionParams()
+        params.nt = self.num_timepoints
+        params.nz = self.num_z
+        # dt is not stored in OME-Zarr multiscales; default to 1.0
+        return params
+
+    def load_image(self, timepoint: int, channel: str, z: int = 0) -> Optional[np.ndarray]:
+        """Load a single 2D image slice."""
+        ch_idx = self._channel_index.get(channel, 0)
+        try:
+            data = self._array[timepoint, ch_idx, z, :, :].read().result()
+            return np.asarray(data)
+        except Exception as e:
+            print(f"Error loading zarr t={timepoint} c={ch_idx} z={z}: {e}")
+            return None
 
 
-def discover_channels_for_pair(baseline_path: str, response_path: str) -> Dict[str, ChannelSettings]:
+def detect_folder_type(folder_path: str) -> str:
+    """Detect whether a folder is TIFF-based or OME-Zarr.
+
+    Returns 'zarr' if the folder contains a zarr.json with zarr_format,
+    'tiff' otherwise.
+    """
+    zarr_json = Path(folder_path) / "zarr.json"
+    if zarr_json.exists():
+        try:
+            with open(zarr_json, 'r') as f:
+                data = json.load(f)
+            if "zarr_format" in data:
+                return "zarr"
+        except Exception:
+            pass
+    return "tiff"
+
+
+_folder_cache: Dict[Tuple[str, int], Any] = {}
+
+
+def open_acquisition_folder(folder_path: str, scale_level: int = 0):
+    """Factory: open a folder as the appropriate type, with caching.
+
+    Returns AcquisitionFolder for TIFF data, ZarrAcquisitionFolder for zarr.
+    Results are cached by (path, scale_level) to avoid re-opening.
+    """
+    key = (folder_path, scale_level)
+    if key in _folder_cache:
+        return _folder_cache[key]
+    folder_type = detect_folder_type(folder_path)
+    if folder_type == "zarr":
+        folder = ZarrAcquisitionFolder(folder_path, scale_level=scale_level)
+    else:
+        folder = AcquisitionFolder(folder_path)
+    _folder_cache[key] = folder
+    return folder
+
+
+def clear_folder_cache():
+    """Clear the folder cache (e.g. when scale level changes)."""
+    _folder_cache.clear()
+
+
+def discover_channels_for_pair(baseline_path: str, response_path: str,
+                               scale_level: int = 0) -> Dict[str, ChannelSettings]:
     """Discover channels from both baseline and response folders."""
     channels = {}
 
     for folder_path in [baseline_path, response_path]:
-        folder = AcquisitionFolder(folder_path)
+        folder = open_acquisition_folder(folder_path, scale_level=scale_level)
         for ch_name in folder.channels:
             if ch_name not in channels:
                 wl = extract_wavelength(ch_name)
@@ -295,12 +477,13 @@ def compute_auto_contrast(folder: AcquisitionFolder, channel: str,
 
 
 def compute_auto_contrast_for_pair(baseline_path: str, response_path: str,
-                                   channel: str) -> Tuple[float, float]:
+                                   channel: str,
+                                   scale_level: int = 0) -> Tuple[float, float]:
     """Compute auto-contrast that works for both baseline and response."""
     all_pixels = []
 
     for folder_path in [baseline_path, response_path]:
-        folder = AcquisitionFolder(folder_path)
+        folder = open_acquisition_folder(folder_path, scale_level=scale_level)
         sample_tps = folder.timepoints[::max(1, len(folder.timepoints)//3)][:3]
 
         for tp in sample_tps:
@@ -484,8 +667,8 @@ def generate_movie_pair(settings: FolderPairSettings,
     if not IMAGEIO_AVAILABLE:
         raise ImportError("imageio is required for movie creation")
 
-    baseline_folder = AcquisitionFolder(settings.baseline_path)
-    response_folder = AcquisitionFolder(settings.response_path)
+    baseline_folder = open_acquisition_folder(settings.baseline_path, scale_level=settings.scale_level)
+    response_folder = open_acquisition_folder(settings.response_path, scale_level=settings.scale_level)
 
     if not baseline_folder.timepoints and not response_folder.timepoints:
         print("No timepoints found in either folder")
@@ -547,9 +730,9 @@ def generate_movie_pair(settings: FolderPairSettings,
 
 
 def load_preview_frame(folder_path: str, channel_settings: Dict[str, ChannelSettings],
-                       timepoint: int = 0) -> Optional[np.ndarray]:
+                       timepoint: int = 0, scale_level: int = 0) -> Optional[np.ndarray]:
     """Load a single frame for preview."""
-    folder = AcquisitionFolder(folder_path)
+    folder = open_acquisition_folder(folder_path, scale_level=scale_level)
     if not folder.timepoints:
         return None
 
@@ -558,9 +741,10 @@ def load_preview_frame(folder_path: str, channel_settings: Dict[str, ChannelSett
 
 
 def get_max_intensity_projection(folder_path: str, channel: str,
-                                max_timepoints: int = 10) -> Optional[np.ndarray]:
+                                max_timepoints: int = 10,
+                                scale_level: int = 0) -> Optional[np.ndarray]:
     """Compute max intensity projection across timepoints for a channel."""
-    folder = AcquisitionFolder(folder_path)
+    folder = open_acquisition_folder(folder_path, scale_level=scale_level)
     if not folder.timepoints:
         return None
 
@@ -581,9 +765,10 @@ def get_max_intensity_projection(folder_path: str, channel: str,
 
 
 def get_channel_histogram(folder_path: str, channel: str,
-                         nbins: int = 256) -> Tuple[np.ndarray, np.ndarray]:
+                         nbins: int = 256,
+                         scale_level: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     """Compute histogram for a channel (sampling across timepoints)."""
-    folder = AcquisitionFolder(folder_path)
+    folder = open_acquisition_folder(folder_path, scale_level=scale_level)
     if not folder.timepoints:
         return np.zeros(nbins), np.linspace(0, 65535, nbins+1)
 
@@ -661,26 +846,34 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python movie_maker_backend.py <baseline_folder> <response_folder>")
+        print("Usage: python movie_maker_backend.py <baseline_folder> <response_folder> [scale_level]")
         sys.exit(1)
 
     baseline = sys.argv[1]
     response = sys.argv[2]
+    scale = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
     print(f"Baseline: {baseline}")
     print(f"Response: {response}")
+    print(f"Folder type: {detect_folder_type(baseline)}")
 
-    baseline_folder = AcquisitionFolder(baseline)
+    baseline_folder = open_acquisition_folder(baseline, scale_level=scale)
     print(f"  dt(s): {baseline_folder.params.dt_seconds}")
     print(f"  Nt: {baseline_folder.params.nt}")
     print(f"  Timepoints found: {len(baseline_folder.timepoints)}")
     print(f"  Channels: {baseline_folder.channels}")
 
-    channels = discover_channels_for_pair(baseline, response)
+    if isinstance(baseline_folder, ZarrAcquisitionFolder):
+        print(f"  Scale level: {baseline_folder.scale_level}")
+        print(f"  Image size: {baseline_folder.image_height}x{baseline_folder.image_width}")
+        print(f"  Available scales: {baseline_folder.get_scale_shapes()}")
+        print(f"  Downsample factors: {baseline_folder.get_downsample_factors()}")
+
+    channels = discover_channels_for_pair(baseline, response, scale_level=scale)
     print(f"\nDiscovered channels:")
     for ch_name, ch_settings in channels.items():
         print(f"  {ch_name}: wavelength={ch_settings.wavelength}, colormap={ch_settings.colormap}")
 
         # Compute auto contrast
-        lo, hi = compute_auto_contrast_for_pair(baseline, response, ch_name)
+        lo, hi = compute_auto_contrast_for_pair(baseline, response, ch_name, scale_level=scale)
         print(f"    Auto contrast: {lo:.0f} - {hi:.0f}")
