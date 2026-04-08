@@ -289,7 +289,7 @@ class PreviewWidget(QWidget):
         sliders_layout.setContentsMargins(0, 5, 0, 0)
         sliders_layout.setSpacing(5)
 
-        # Baseline timepoint slider
+        # Baseline timepoint slider + frame count
         baseline_tp_layout = QHBoxLayout()
         baseline_tp_label = QLabel("Baseline Timepoint:")
         baseline_tp_label.setStyleSheet("color: #2196F3;")
@@ -303,9 +303,12 @@ class PreviewWidget(QWidget):
         self.baseline_tp_label = QLabel("0")
         self.baseline_tp_label.setFixedWidth(40)
         baseline_tp_layout.addWidget(self.baseline_tp_label)
+        self.baseline_frames_spin = self._make_frames_spin("baseline")
+        baseline_tp_layout.addWidget(QLabel("Frames:"))
+        baseline_tp_layout.addWidget(self.baseline_frames_spin)
         sliders_layout.addLayout(baseline_tp_layout)
 
-        # Response timepoint slider
+        # Response timepoint slider + frame count
         response_tp_layout = QHBoxLayout()
         response_tp_label = QLabel("Response Timepoint:")
         response_tp_label.setStyleSheet("color: #FF9800;")
@@ -319,6 +322,9 @@ class PreviewWidget(QWidget):
         self.response_tp_label = QLabel("0")
         self.response_tp_label.setFixedWidth(40)
         response_tp_layout.addWidget(self.response_tp_label)
+        self.response_frames_spin = self._make_frames_spin("response")
+        response_tp_layout.addWidget(QLabel("Frames:"))
+        response_tp_layout.addWidget(self.response_frames_spin)
         sliders_layout.addLayout(response_tp_layout)
 
         layout.addWidget(sliders_widget)
@@ -334,18 +340,19 @@ class PreviewWidget(QWidget):
         self.baseline_folder = open_acquisition_folder(baseline_path, scale_level=scale_level) if baseline_path else None
         self.response_folder = open_acquisition_folder(response_path, scale_level=scale_level) if response_path else None
 
-        # Update timepoint sliders
-        baseline_max = 0
-        response_max = 0
-        if self.baseline_folder and self.baseline_folder.timepoints:
-            baseline_max = len(self.baseline_folder.timepoints) - 1
-        if self.response_folder and self.response_folder.timepoints:
-            response_max = len(self.response_folder.timepoints) - 1
+        # Update timepoint sliders and frame count spinboxes
+        baseline_count = len(self.baseline_folder.timepoints) if self.baseline_folder and self.baseline_folder.timepoints else 0
+        response_count = len(self.response_folder.timepoints) if self.response_folder and self.response_folder.timepoints else 0
 
-        self.baseline_tp_slider.setMaximum(baseline_max)
+        self.baseline_tp_slider.setMaximum(max(0, baseline_count - 1))
         self.baseline_tp_slider.setValue(0)
-        self.response_tp_slider.setMaximum(response_max)
+        self.baseline_frames_spin.setMaximum(max(1, baseline_count))
+        self.baseline_frames_spin.setValue(baseline_count)
+
+        self.response_tp_slider.setMaximum(max(0, response_count - 1))
         self.response_tp_slider.setValue(0)
+        self.response_frames_spin.setMaximum(max(1, response_count))
+        self.response_frames_spin.setValue(response_count)
 
     def set_channel_settings(self, settings: Dict[str, ChannelSettings]):
         """Set channel settings for preview."""
@@ -361,6 +368,15 @@ class PreviewWidget(QWidget):
         """Handle response timepoint change."""
         self.response_tp_label.setText(str(value))
         self._update_preview()
+
+    @staticmethod
+    def _make_frames_spin(label: str) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setMinimum(1)
+        spin.setMaximum(9999)
+        spin.setFixedWidth(60)
+        spin.setToolTip(f"Number of {label} frames to use (first N)")
+        return spin
 
     def _update_preview(self):
         """Update the preview image (side-by-side view)."""
@@ -530,7 +546,9 @@ class PairRowWidget(QWidget):
         self.select_btn.setChecked(selected)
 
     def get_settings(self, channel_settings: Dict[str, ChannelSettings],
-                     scale_level: int = 0) -> FolderPairSettings:
+                     scale_level: int = 0,
+                     num_baseline_frames: Optional[int] = None,
+                     num_response_frames: Optional[int] = None) -> FolderPairSettings:
         """Get settings for this pair."""
         return FolderPairSettings(
             baseline_path=self.baseline_path,
@@ -538,7 +556,9 @@ class PairRowWidget(QWidget):
             channels=channel_settings,
             frame_interval_seconds=self.dt_seconds,
             output_fps=self.fps_spin.value(),
-            scale_level=scale_level
+            scale_level=scale_level,
+            num_baseline_frames=num_baseline_frames,
+            num_response_frames=num_response_frames
         )
 
 
@@ -1125,12 +1145,13 @@ class MovieMakerGUI(QMainWindow):
 
         # Collect pairs with their individual settings
         scale_level = self._get_scale_level()
+        num_baseline = self.preview_widget.baseline_frames_spin.value()
+        num_response = self.preview_widget.response_frames_spin.value()
         pairs = []
         for i, row in enumerate(self.pair_rows):
             # Get settings for this specific pair (use auto-contrast if not set)
             pair_channel_settings = self.per_pair_settings.get(i)
             if not pair_channel_settings:
-                # Auto-contrast for pairs that were never selected
                 channels = discover_channels_for_pair(row.baseline_path, row.response_path,
                                                       scale_level=scale_level)
                 pair_channel_settings = {}
@@ -1142,7 +1163,9 @@ class MovieMakerGUI(QMainWindow):
                     pair_channel_settings[ch_name] = ch_settings
                 self.per_pair_settings[i] = pair_channel_settings
 
-            settings = row.get_settings(pair_channel_settings, scale_level=scale_level)
+            settings = row.get_settings(pair_channel_settings, scale_level=scale_level,
+                                        num_baseline_frames=num_baseline,
+                                        num_response_frames=num_response)
             name = f"movie_{os.path.basename(row.baseline_path)}"
             pairs.append((settings, name))
 

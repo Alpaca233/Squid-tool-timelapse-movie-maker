@@ -103,6 +103,8 @@ class FolderPairSettings:
     frame_interval_seconds: float = 1.0
     output_fps: int = 10
     scale_level: int = 0
+    num_baseline_frames: Optional[int] = None
+    num_response_frames: Optional[int] = None
 
     def get_channel_names(self) -> List[str]:
         """Get sorted list of channel names."""
@@ -677,6 +679,13 @@ def generate_movie_pair(settings: FolderPairSettings,
     fps = settings.output_fps
     dt = settings.frame_interval_seconds
 
+    baseline_tps = baseline_folder.timepoints
+    response_tps = response_folder.timepoints
+    if settings.num_baseline_frames is not None:
+        baseline_tps = baseline_tps[:settings.num_baseline_frames]
+    if settings.num_response_frames is not None:
+        response_tps = response_tps[:settings.num_response_frames]
+
     output_path = os.path.join(output_dir, f"{output_name}.mp4")
 
     try:
@@ -692,13 +701,13 @@ def generate_movie_pair(settings: FolderPairSettings,
         else:
             writer = imageio.get_writer(output_path, fps=fps)
 
-        total_frames = len(baseline_folder.timepoints) + len(response_folder.timepoints)
+        total_frames = len(baseline_tps) + len(response_tps)
         current_frame = 0
 
         # Write baseline frames first
         if progress_callback:
             progress_callback("Creating movie (baseline frames)...")
-        for tp in baseline_folder.timepoints:
+        for tp in baseline_tps:
             frame = create_composite_frame(baseline_folder, tp, settings.channels)
             if add_timestamp:
                 frame = add_timestamp_overlay(frame, tp, dt, label="Baseline")
@@ -710,7 +719,7 @@ def generate_movie_pair(settings: FolderPairSettings,
         # Write response frames
         if progress_callback:
             progress_callback("Creating movie (response frames)...")
-        for tp in response_folder.timepoints:
+        for tp in response_tps:
             frame = create_composite_frame(response_folder, tp, settings.channels)
             if add_timestamp:
                 frame = add_timestamp_overlay(frame, tp, dt, label="Response")
