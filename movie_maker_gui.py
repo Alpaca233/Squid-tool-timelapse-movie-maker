@@ -517,11 +517,15 @@ class PairRowWidget(QWidget):
         paths_widget.setFixedWidth(250)
         layout.addWidget(paths_widget)
 
-        # Frame interval display (read-only)
-        dt_label = QLabel(f"dt: {self.dt_seconds:.2f}s")
-        dt_label.setStyleSheet("color: #888;")
-        dt_label.setToolTip("Frame interval (seconds) from acquisition parameters")
-        layout.addWidget(dt_label)
+        # Frame interval (editable — auto-populated from acquisition parameters)
+        layout.addWidget(QLabel("dt(s):"))
+        self.dt_spin = QDoubleSpinBox()
+        self.dt_spin.setRange(0.01, 9999.0)
+        self.dt_spin.setDecimals(2)
+        self.dt_spin.setValue(self.dt_seconds)
+        self.dt_spin.setFixedWidth(65)
+        self.dt_spin.setToolTip("Seconds between frames (auto-detected from acquisition parameters, editable)")
+        layout.addWidget(self.dt_spin)
 
         # Output FPS
         layout.addWidget(QLabel("FPS:"))
@@ -554,7 +558,7 @@ class PairRowWidget(QWidget):
             baseline_path=self.baseline_path,
             response_path=self.response_path,
             channels=channel_settings,
-            frame_interval_seconds=self.dt_seconds,
+            frame_interval_seconds=self.dt_spin.value(),
             output_fps=self.fps_spin.value(),
             scale_level=scale_level,
             num_baseline_frames=num_baseline_frames,
