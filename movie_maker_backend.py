@@ -46,8 +46,19 @@ except ImportError:
     TENSORSTORE_AVAILABLE = False
 
 
-# Filename pattern for single TIFF files
-FPATTERN = re.compile(r"(?P<r>[^_]+)_(?P<f>\d+)_(?P<z>\d+)_(?P<c>.+)\.tiff?", re.IGNORECASE)
+# Filename pattern for single TIFF files. Handles both Squid layouts:
+#   regular multipoint : {region}_{fov}_{z}_{channel}.tiff       (2 numeric fields)
+#   flexible multipoint: {region}_{m}_{n}_{z}_{channel}.tiff     (3 numeric fields)
+# `pre` greedily consumes the leading coordinate fields; `z` is the last numeric
+# field and `c` is the channel. This assumes a channel name never starts with a
+# bare numeric token, which holds for Squid names (Fluorescence_488_nm_Ex, etc.).
+FPATTERN = re.compile(
+    r"(?P<region>[^_]+)_(?P<pre>(?:\d+_)*)(?P<z>\d+)_(?P<c>.+)\.tiff?$",
+    re.IGNORECASE,
+)
+
+# Recognized single-image extensions.
+TIFF_SUFFIXES = ('.tif', '.tiff')
 
 
 @dataclass
@@ -219,37 +230,35 @@ class AcquisitionFolder(AcquisitionFolderBase):
                 timepoints.append(int(item.name))
         return sorted(timepoints)
 
+    def _iter_parsed_tiffs(self, tp_dir: Path):
+        """Yield (path, match) for each TIFF in a timepoint dir parsed by FPATTERN."""
+        for f in tp_dir.iterdir():
+            if f.suffix.lower() in TIFF_SUFFIXES:
+                if m := FPATTERN.search(f.name):
+                    yield f, m
+
     def _discover_channels(self) -> List[str]:
         """Discover unique channel names from first timepoint."""
-        channels = set()
         if not self.timepoints:
             return []
-
         tp_dir = self.path / str(self.timepoints[0])
-        for f in tp_dir.iterdir():
-            if f.suffix.lower() in ['.tif', '.tiff']:
-                if m := FPATTERN.search(f.name):
-                    channels.add(m.group('c'))
-        return sorted(channels)
+        return sorted({m.group('c') for _, m in self._iter_parsed_tiffs(tp_dir)})
 
-    def get_image_path(self, timepoint: int, channel: str, z: int = 0, region: str = "current", fov: int = 0) -> Optional[Path]:
-        """Get the path to a specific image file."""
+    def get_image_path(self, timepoint: int, channel: str, z: int = 0) -> Optional[Path]:
+        """Get the path to a specific image file.
+
+        Scans the timepoint directory and matches files by parsed channel and
+        z, so it works for both filename layouts (see FPATTERN) regardless of
+        region name or number of coordinate fields. When multiple positions
+        match (e.g. flexible multipoint), the first in sorted order is used.
+        """
         tp_dir = self.path / str(timepoint)
         if not tp_dir.exists():
             return None
 
-        # Pattern: {region}_{fov}_{z}_{channel}.tiff
-        filename = f"{region}_{fov}_{z}_{channel}.tiff"
-        filepath = tp_dir / filename
-        if filepath.exists():
-            return filepath
-
-        # Try .tif extension
-        filepath = tp_dir / f"{region}_{fov}_{z}_{channel}.tif"
-        if filepath.exists():
-            return filepath
-
-        return None
+        matches = [f for f, m in self._iter_parsed_tiffs(tp_dir)
+                   if m.group('c') == channel and int(m.group('z')) == z]
+        return min(matches, default=None)
 
     def load_image(self, timepoint: int, channel: str, z: int = 0) -> Optional[np.ndarray]:
         """Load a single image."""
